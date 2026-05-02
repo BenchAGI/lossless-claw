@@ -8,6 +8,12 @@ import type {
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import {
+  formatWikiHits,
+  sumWikiTokens,
+  type WikiHit,
+  type WikiRetrievalEngine,
+} from "./wiki/retrieval.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
@@ -119,6 +125,16 @@ export interface AssembleContextInput {
   promptAwareEviction?: boolean;
   /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
   orphanStrippingOrdinal?: number;
+  /**
+   * Token budget reserved for wiki injection at the head of assembled context.
+   * When > 0 and a `WikiRetrievalEngine` is wired into the assembler, this
+   * many tokens are subtracted from the LCM budget and reallocated to wiki
+   * hits scored against `prompt`. No-op when no engine is configured or
+   * `prompt` is missing/unsearchable.
+   */
+  wikiBudget?: number;
+  /** Hard cap on wiki entries injected per assemble. Defaults to 8. */
+  wikiMaxEntries?: number;
 }
 
 export interface AssembleContextResult {
@@ -153,6 +169,12 @@ export interface AssembleContextResult {
     preSanitizeMessagesHash: string;
     finalMessagesHash: string;
     overflowDiagnostics: AssemblyOverflowDiagnostics;
+    /** Number of wiki entries injected at head of context (0 when wiki disabled). */
+    wikiHitCount: number;
+    /** Estimated tokens consumed by injected wiki content. */
+    wikiTokens: number;
+    /** Token budget actually allocated to LCM history (input.tokenBudget − wikiBudgetUsed). */
+    lcmBudget: number;
   };
 }
 
@@ -1060,6 +1082,12 @@ function hasSearchablePrompt(prompt?: string): prompt is string {
   return typeof prompt === "string" && tokenizeText(prompt).length > 0;
 }
 
+function normalizeAssemblyTokenBudget(tokenBudget: number): number {
+  return Number.isFinite(tokenBudget) && tokenBudget > 0
+    ? Math.floor(tokenBudget)
+    : 0;
+}
+
 // ── ContextAssembler ─────────────────────────────────────────────────────────
 
 export class ContextAssembler {
@@ -1067,6 +1095,14 @@ export class ContextAssembler {
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private timezone?: string,
+    /**
+     * Optional wiki retrieval engine. When provided AND `input.wikiBudget > 0`
+     * AND `input.prompt` is searchable, top-scoring wiki hits are injected as a
+     * synthetic user message at the head of assembled context. The wiki
+     * budget is subtracted from the LCM budget so the combined prompt stays
+     * within `input.tokenBudget`.
+     */
+    private wikiEngine?: WikiRetrievalEngine,
   ) {}
 
   /**
@@ -1081,7 +1117,8 @@ export class ContextAssembler {
    * 5. Return the final ordered messages in chronological order.
    */
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
-    const { conversationId, tokenBudget } = input;
+    const { conversationId } = input;
+    const totalTokenBudget = normalizeAssemblyTokenBudget(input.tokenBudget);
     const freshTailCount = input.freshTailCount ?? 8;
 
     // Step 1: Get all context items ordered by ordinal
@@ -1144,6 +1181,17 @@ export class ContextAssembler {
     for (const item of freshTail) {
       tailTokens += item.tokens;
     }
+
+    // Reserve wiki only from budget that remains after the protected fresh
+    // tail. The fresh tail is intentionally never dropped; if it consumes the
+    // whole budget, wiki retrieval becomes a no-op instead of adding overflow.
+    const wikiBudget = Math.min(
+      this.normalizeWikiBudget(input.wikiBudget),
+      Math.max(0, totalTokenBudget - tailTokens),
+    );
+    const wikiHits: readonly WikiHit[] = this.runWikiRetrieval(input, wikiBudget);
+    const wikiTokensUsed = sumWikiTokens(wikiHits);
+    const tokenBudget = Math.max(0, totalTokenBudget - wikiTokensUsed);
 
     // Fill remaining budget from evictable items, oldest first.
     // If the fresh tail alone exceeds the budget we still include it
@@ -1266,9 +1314,23 @@ export class ContextAssembler {
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+
+    // Inject wiki hits at the head of assembled context as a synthetic user
+    // message. The XML wrapper signals to the model that this is reference
+    // knowledge, not conversation history. Wiki tokens were already reserved
+    // out of `input.tokenBudget` at the top of assemble(), so the combined
+    // prompt fits within the requested budget.
+    const finalMessages: AgentMessage[] = wikiHits.length > 0
+      ? [
+          { role: "user", content: formatWikiHits(wikiHits) } as AgentMessage,
+          ...repaired,
+        ]
+      : repaired;
+    const finalEstimatedTokens = estimatedTokens + wikiTokensUsed;
+
     return {
-      messages: repaired,
-      estimatedTokens,
+      messages: finalMessages,
+      estimatedTokens: finalEstimatedTokens,
       stats: {
         rawMessageCount,
         summaryCount,
@@ -1294,11 +1356,36 @@ export class ContextAssembler {
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,
+        wikiHitCount: wikiHits.length,
+        wikiTokens: wikiTokensUsed,
+        lcmBudget: tokenBudget,
       },
     };
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
+
+  private normalizeWikiBudget(wikiBudget: number | undefined): number {
+    return typeof wikiBudget === "number" && Number.isFinite(wikiBudget) && wikiBudget > 0
+      ? Math.floor(wikiBudget)
+      : 0;
+  }
+
+  /**
+   * Score wiki entries against `input.prompt` and return the hits to inject.
+   * Returns `[]` when no engine is configured, the wiki budget is zero, or
+   * the prompt is missing/unsearchable. The returned hits' formatted token
+   * estimate is guaranteed to fit within `wikiBudget`.
+   */
+  private runWikiRetrieval(input: AssembleContextInput, wikiBudget: number): WikiHit[] {
+    if (!this.wikiEngine) return [];
+    if (wikiBudget <= 0) return [];
+    if (typeof input.prompt !== "string" || input.prompt.trim().length === 0) return [];
+    return this.wikiEngine.searchWiki(input.prompt, {
+      maxEntries: input.wikiMaxEntries ?? 8,
+      maxTokens: wikiBudget,
+    });
+  }
 
   /**
    * Resolve a list of context items into ResolvedItems by fetching the

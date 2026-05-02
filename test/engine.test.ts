@@ -71,6 +71,12 @@ function createTestConfig(databasePath: string): LcmConfig {
       enabled: true,
       max: 40_000,
     },
+    wikiEnabled: false,
+    wikiVaultPath: join(databasePath, "..", "wiki", "main"),
+    wikiBudgetFraction: 0.30,
+    wikiMaxTokens: 8000,
+    wikiMaxEntries: 8,
+    wikiRefreshIntervalMs: 60_000,
   };
 }
 

@@ -111,6 +111,18 @@ export type LcmConfig = {
   cacheAwareCompaction: CacheAwareCompactionConfig;
   /** Dynamic step-band policy for incremental leaf chunk sizing. */
   dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
+  /** When true, augment assembled context with hits from a local wiki vault. */
+  wikiEnabled: boolean;
+  /** Absolute path to the wiki vault root (markdown files). Default: `<stateDir>/wiki/main`. */
+  wikiVaultPath: string;
+  /** Fraction of the assembly token budget reserved for wiki injection (0–1). */
+  wikiBudgetFraction: number;
+  /** Hard cap on wiki tokens per assemble, regardless of fraction. */
+  wikiMaxTokens: number;
+  /** Hard cap on wiki entries injected per assemble. */
+  wikiMaxEntries: number;
+  /** TTL in ms before the wiki index is rebuilt from disk. */
+  wikiRefreshIntervalMs: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -136,6 +148,14 @@ function parseFiniteNumber(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const parsed = parseFloat(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Clamp a value to the [0, 1] range; non-finite input falls back to 0. */
+function clampFraction(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
 }
 
 /** Parse fallback providers from env string (format: "provider/model,provider/model"). */
@@ -468,6 +488,33 @@ export function resolveLcmConfigWithDiagnostics(
             : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
         max: resolvedDynamicLeafChunkMax,
       },
+      wikiEnabled:
+        env.LCM_WIKI_ENABLED !== undefined
+          ? env.LCM_WIKI_ENABLED !== "false"
+          : toBool(pc.wikiEnabled) ?? true,
+      wikiVaultPath:
+        env.LCM_WIKI_VAULT_PATH?.trim()
+        ?? toStr(pc.wikiVaultPath)
+        ?? join(resolveOpenclawStateDir(env), "wiki", "main"),
+      wikiBudgetFraction: clampFraction(
+        parseFiniteNumber(env.LCM_WIKI_BUDGET_FRACTION)
+          ?? toNumber(pc.wikiBudgetFraction)
+          ?? 0.30,
+      ),
+      wikiMaxTokens: Math.max(
+        0,
+        parseFiniteInt(env.LCM_WIKI_MAX_TOKENS) ?? toNumber(pc.wikiMaxTokens) ?? 8000,
+      ),
+      wikiMaxEntries: Math.max(
+        0,
+        parseFiniteInt(env.LCM_WIKI_MAX_ENTRIES) ?? toNumber(pc.wikiMaxEntries) ?? 8,
+      ),
+      wikiRefreshIntervalMs: Math.max(
+        0,
+        parseFiniteInt(env.LCM_WIKI_REFRESH_INTERVAL_MS)
+          ?? toNumber(pc.wikiRefreshIntervalMs)
+          ?? 60_000,
+      ),
     },
     diagnostics: {
       ignoreSessionPatternsSource: ignoreSessionPatterns.source,
