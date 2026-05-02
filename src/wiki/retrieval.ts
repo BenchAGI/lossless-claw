@@ -9,8 +9,8 @@
  * the directory layer by the OpenClaw runtime — and is never merged
  * into the LCM SQLite store.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import { scoreRelevance, tokenizeText } from "../assembler.js";
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
@@ -18,6 +18,8 @@ const DEFAULT_REFRESH_MS = 60_000;
 const TITLE_BOOST = 3.0;
 const TAGS_BOOST = 1.5;
 const KIND_BOOST = 0.5;
+const WIKI_WRAPPER_TOKEN_OVERHEAD = 64;
+const WIKI_ENTRY_TOKEN_OVERHEAD = 24;
 
 /** Status values that mark an entry as no longer authoritative. */
 const NON_ACTIVE_STATUSES = new Set(["deprecated", "archived", "superseded", "draft"]);
@@ -53,7 +55,7 @@ export interface WikiHit {
 export interface WikiSearchOptions {
   /** Hard cap on selected entries. */
   maxEntries: number;
-  /** Hard cap on total body tokens across selected entries. */
+  /** Hard cap on estimated formatted wiki tokens, including wrapper overhead. */
   maxTokens: number;
   /**
    * Optional agent identifier. Reserved for future per-agent filtering
@@ -83,7 +85,7 @@ export interface WikiRetrievalDiagnostics {
 export function parseFrontmatter(raw: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   let listKey: string | null = null;
-  for (const rawLine of raw.split(/\r?\n/)) {
+  for (const rawLine of stripBom(raw).split(/\r?\n/)) {
     if (rawLine.length === 0) {
       listKey = null;
       continue;
@@ -132,6 +134,10 @@ function stripQuotes(value: string): string {
     }
   }
   return value;
+}
+
+function stripBom(value: string): string {
+  return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
 }
 
 function deriveId(frontmatter: Record<string, unknown>, relativePath: string): string {
@@ -199,9 +205,17 @@ function walkMarkdownFiles(root: string): string[] {
 export function loadWikiEntry(absPath: string, vaultRoot: string): WikiEntry | null {
   let raw: string;
   let stats;
+  let realPath: string;
+  let realVaultRoot: string;
   try {
-    raw = readFileSync(absPath, "utf8");
-    stats = statSync(absPath);
+    realVaultRoot = realpathSync(vaultRoot);
+    realPath = realpathSync(absPath);
+    const rel = relative(realVaultRoot, realPath);
+    if (rel.startsWith("..") || isAbsolute(rel)) {
+      return null;
+    }
+    raw = stripBom(readFileSync(realPath, "utf8"));
+    stats = statSync(realPath);
   } catch {
     return null;
   }
@@ -214,11 +228,11 @@ export function loadWikiEntry(absPath: string, vaultRoot: string): WikiEntry | n
     body = raw.slice(fmMatch[0].length);
   }
 
-  const relativePath = relative(vaultRoot, absPath);
+  const relativePath = relative(realVaultRoot, realPath);
   const kindRaw = frontmatter.kind;
   return {
     id: deriveId(frontmatter, relativePath),
-    path: absPath,
+    path: realPath,
     relativePath,
     title: deriveTitle(frontmatter, relativePath),
     kind: typeof kindRaw === "string" ? kindRaw.trim() : "",
@@ -273,16 +287,23 @@ export class WikiRetrievalEngine {
 
   /**
    * Score the wiki against `query` and return up to `maxEntries` hits whose
-   * combined body tokens stay under `maxTokens`. Returns [] when the query
-   * has no searchable terms or the vault is empty / missing.
+   * formatted token estimate stays under `maxTokens`. Returns [] when the
+   * query has no searchable terms or the vault is empty / missing.
    */
   searchWiki(query: string, options: WikiSearchOptions): WikiHit[] {
     if (typeof query !== "string" || tokenizeText(query).length === 0) {
       return [];
     }
-    if (options.maxEntries <= 0 || options.maxTokens <= 0) {
+    if (
+      !Number.isFinite(options.maxEntries) ||
+      !Number.isFinite(options.maxTokens) ||
+      options.maxEntries <= 0 ||
+      options.maxTokens <= 0
+    ) {
       return [];
     }
+    const maxEntries = Math.floor(options.maxEntries);
+    const maxTokens = Math.floor(options.maxTokens);
     this.refreshIfStale();
     if (this.entries.length === 0) {
       return [];
@@ -311,10 +332,14 @@ export class WikiRetrievalEngine {
     const selected: WikiHit[] = [];
     let tokenAccum = 0;
     for (const candidate of candidates) {
-      if (selected.length >= options.maxEntries) break;
-      if (tokenAccum + candidate.entry.bodyTokens > options.maxTokens) continue;
+      if (selected.length >= maxEntries) break;
+      const projected =
+        (selected.length === 0 ? WIKI_WRAPPER_TOKEN_OVERHEAD : tokenAccum) +
+        WIKI_ENTRY_TOKEN_OVERHEAD +
+        candidate.entry.bodyTokens;
+      if (projected > maxTokens) continue;
       selected.push(candidate);
-      tokenAccum += candidate.entry.bodyTokens;
+      tokenAccum = projected;
     }
     return selected;
   }
@@ -342,9 +367,15 @@ export class WikiRetrievalEngine {
 
 /** XML-encode a value for attribute use. */
 function escapeAttr(value: string): string {
+  return escapeText(value)
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/** XML-encode text content. */
+function escapeText(value: string): string {
   return value
     .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
@@ -373,7 +404,7 @@ export function formatWikiHits(hits: readonly WikiHit[]): string {
     }
     lines.push(`  <entry ${attrs.join(" ")}>`);
     for (const bodyLine of hit.entry.body.split(/\r?\n/)) {
-      lines.push(`    ${bodyLine}`);
+      lines.push(`    ${escapeText(bodyLine)}`);
     }
     lines.push("  </entry>");
   }
@@ -384,10 +415,10 @@ export function formatWikiHits(hits: readonly WikiHit[]): string {
 /** Total body tokens across hits, plus a small fixed wrapper overhead. */
 export function sumWikiTokens(hits: readonly WikiHit[]): number {
   if (hits.length === 0) return 0;
-  let total = 64; // wrapper preamble overhead, roughly
+  let total = WIKI_WRAPPER_TOKEN_OVERHEAD;
   for (const hit of hits) {
     total += hit.entry.bodyTokens;
-    total += 24; // per-entry XML tag overhead, conservative
+    total += WIKI_ENTRY_TOKEN_OVERHEAD;
   }
   return total;
 }

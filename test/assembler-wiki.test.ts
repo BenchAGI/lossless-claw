@@ -371,6 +371,86 @@ describe("ContextAssembler wiki injection", () => {
     expect(result.estimatedTokens).toBeLessThanOrEqual(totalBudget);
   });
 
+  it("does not inject wiki when wrapper overhead cannot fit the available budget", async () => {
+    const { engine, vaultPath } = createEngine();
+    writeWikiEntry(
+      vaultPath,
+      "tiny.md",
+      { title: "Tiny hammer", status: "active" },
+      "x",
+    );
+    const sessionId = randomUUID();
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "hammer" }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "assistant", content: "ok" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    const wikiEngine = new WikiRetrievalEngine({ vaultPath, refreshIntervalMs: 0 });
+
+    const assembler = new ContextAssembler(
+      engine.getConversationStore(),
+      engine.getSummaryStore(),
+      "UTC",
+      wikiEngine,
+    );
+    const result = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 88,
+      prompt: "hammer",
+      wikiBudget: 88,
+    });
+
+    expect(result.debug?.wikiHitCount).toBe(0);
+    expect(result.debug?.wikiTokens).toBe(0);
+    expect(result.estimatedTokens).toBeLessThanOrEqual(88);
+  });
+
+  it("does not let wiki consume budget reserved by the protected fresh tail", async () => {
+    const { engine, vaultPath } = createEngine();
+    writeWikiEntry(
+      vaultPath,
+      "tiny.md",
+      { title: "Tiny hammer", status: "active" },
+      "x",
+    );
+    const sessionId = randomUUID();
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "hammer " + "tail ".repeat(280) }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "assistant", content: "ok" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    const wikiEngine = new WikiRetrievalEngine({ vaultPath, refreshIntervalMs: 0 });
+
+    const assembler = new ContextAssembler(
+      engine.getConversationStore(),
+      engine.getSummaryStore(),
+      "UTC",
+      wikiEngine,
+    );
+    const result = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 120,
+      prompt: "hammer",
+      wikiBudget: 120,
+    });
+
+    expect(result.debug?.tailTokens ?? 0).toBeGreaterThan(31);
+    expect(result.debug?.wikiHitCount).toBe(0);
+    expect(result.debug?.wikiTokens).toBe(0);
+  });
+
   it("returns no hits when the vault is empty even with prompt + budget set", async () => {
     const { engine, vaultPath } = createEngine();
     // No entries written.

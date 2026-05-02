@@ -1082,6 +1082,12 @@ function hasSearchablePrompt(prompt?: string): prompt is string {
   return typeof prompt === "string" && tokenizeText(prompt).length > 0;
 }
 
+function normalizeAssemblyTokenBudget(tokenBudget: number): number {
+  return Number.isFinite(tokenBudget) && tokenBudget > 0
+    ? Math.floor(tokenBudget)
+    : 0;
+}
+
 // ── ContextAssembler ─────────────────────────────────────────────────────────
 
 export class ContextAssembler {
@@ -1112,13 +1118,7 @@ export class ContextAssembler {
    */
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
     const { conversationId } = input;
-    // Reserve the wiki budget upfront and run LCM assembly with the reduced
-    // budget so the combined prompt (wiki + LCM) stays within input.tokenBudget.
-    // The wiki engine is best-effort: if it returns no hits we still ran with
-    // a reduced budget, which is harmless (final prompt is just smaller).
-    const wikiHits: readonly WikiHit[] = this.runWikiRetrieval(input);
-    const wikiTokensUsed = sumWikiTokens(wikiHits);
-    const tokenBudget = Math.max(0, input.tokenBudget - wikiTokensUsed);
+    const totalTokenBudget = normalizeAssemblyTokenBudget(input.tokenBudget);
     const freshTailCount = input.freshTailCount ?? 8;
 
     // Step 1: Get all context items ordered by ordinal
@@ -1181,6 +1181,17 @@ export class ContextAssembler {
     for (const item of freshTail) {
       tailTokens += item.tokens;
     }
+
+    // Reserve wiki only from budget that remains after the protected fresh
+    // tail. The fresh tail is intentionally never dropped; if it consumes the
+    // whole budget, wiki retrieval becomes a no-op instead of adding overflow.
+    const wikiBudget = Math.min(
+      this.normalizeWikiBudget(input.wikiBudget),
+      Math.max(0, totalTokenBudget - tailTokens),
+    );
+    const wikiHits: readonly WikiHit[] = this.runWikiRetrieval(input, wikiBudget);
+    const wikiTokensUsed = sumWikiTokens(wikiHits);
+    const tokenBudget = Math.max(0, totalTokenBudget - wikiTokensUsed);
 
     // Fill remaining budget from evictable items, oldest first.
     // If the fresh tail alone exceeds the budget we still include it
@@ -1354,19 +1365,25 @@ export class ContextAssembler {
 
   // ── Private helpers ──────────────────────────────────────────────────────
 
+  private normalizeWikiBudget(wikiBudget: number | undefined): number {
+    return typeof wikiBudget === "number" && Number.isFinite(wikiBudget) && wikiBudget > 0
+      ? Math.floor(wikiBudget)
+      : 0;
+  }
+
   /**
    * Score wiki entries against `input.prompt` and return the hits to inject.
    * Returns `[]` when no engine is configured, the wiki budget is zero, or
-   * the prompt is missing/unsearchable. The returned hits' combined body
-   * tokens are guaranteed to fit within `input.wikiBudget`.
+   * the prompt is missing/unsearchable. The returned hits' formatted token
+   * estimate is guaranteed to fit within `wikiBudget`.
    */
-  private runWikiRetrieval(input: AssembleContextInput): WikiHit[] {
+  private runWikiRetrieval(input: AssembleContextInput, wikiBudget: number): WikiHit[] {
     if (!this.wikiEngine) return [];
-    if (typeof input.wikiBudget !== "number" || input.wikiBudget <= 0) return [];
+    if (wikiBudget <= 0) return [];
     if (typeof input.prompt !== "string" || input.prompt.trim().length === 0) return [];
     return this.wikiEngine.searchWiki(input.prompt, {
       maxEntries: input.wikiMaxEntries ?? 8,
-      maxTokens: input.wikiBudget,
+      maxTokens: wikiBudget,
     });
   }
 

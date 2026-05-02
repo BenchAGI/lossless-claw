@@ -104,8 +104,10 @@ Ties are broken by recency (`modifiedAt`). Entries with `status` in
 
 Candidates are sorted by score and walked in order. An entry is
 selected if it fits under both `maxEntries` and `maxTokens` simultaneously.
-A too-large entry is skipped (not used to short-circuit the loop) so that
-smaller, lower-ranked entries can still fill the remaining budget.
+`maxTokens` is checked against the same estimate used for injection:
+body tokens plus fixed wrapper and per-entry XML overhead. A too-large
+entry is skipped (not used to short-circuit the loop) so that smaller,
+lower-ranked entries can still fill the remaining budget.
 
 ## Configuration
 
@@ -120,9 +122,10 @@ Six new `LcmConfig` fields drive wiki retrieval:
 | `wikiMaxEntries` | `LCM_WIKI_MAX_ENTRIES` | `8` | Hard cap on entries per assemble. |
 | `wikiRefreshIntervalMs` | `LCM_WIKI_REFRESH_INTERVAL_MS` | `60_000` | Index TTL. |
 
-The wiki budget at assemble time is `min(tokenBudget × fraction, maxTokens)`.
-At the default 30 % fraction with a 128 k assembly budget, the cap fires
-first (8 k wins over 38 k).
+The wiki budget at assemble time starts as `min(tokenBudget × fraction,
+maxTokens)`, then is capped by whatever budget remains after the
+protected fresh tail. At the default 30 % fraction with a 128 k assembly
+budget, the cap usually fires first (8 k wins over 38 k).
 
 To disable wiki retrieval entirely without touching config files:
 
@@ -188,11 +191,10 @@ conversation history. The preamble instructs citing-by-id; the
 attributes give the model enough metadata to disambiguate. Attribute
 values are XML-escaped.
 
-Token accounting: wiki tokens are deducted from the LCM budget *before*
-LCM assembly runs, so the combined prompt stays within
-`input.tokenBudget`. If the wiki engine returns zero hits, the LCM
-assembly still ran with the reduced budget — harmless, just a slightly
-smaller final prompt.
+Token accounting: wiki tokens are deducted from the LCM budget before
+evictable LCM history is selected, and wiki retrieval is skipped when
+the protected fresh tail leaves no room for the XML wrapper. If the wiki
+engine returns zero hits, the final prompt is just LCM history.
 
 ## Diagnostics
 
