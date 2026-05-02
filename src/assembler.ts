@@ -8,6 +8,12 @@ import type {
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import {
+  formatWikiHits,
+  sumWikiTokens,
+  type WikiHit,
+  type WikiRetrievalEngine,
+} from "./wiki/retrieval.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
@@ -119,6 +125,16 @@ export interface AssembleContextInput {
   promptAwareEviction?: boolean;
   /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
   orphanStrippingOrdinal?: number;
+  /**
+   * Token budget reserved for wiki injection at the head of assembled context.
+   * When > 0 and a `WikiRetrievalEngine` is wired into the assembler, this
+   * many tokens are subtracted from the LCM budget and reallocated to wiki
+   * hits scored against `prompt`. No-op when no engine is configured or
+   * `prompt` is missing/unsearchable.
+   */
+  wikiBudget?: number;
+  /** Hard cap on wiki entries injected per assemble. Defaults to 8. */
+  wikiMaxEntries?: number;
 }
 
 export interface AssembleContextResult {
@@ -153,6 +169,12 @@ export interface AssembleContextResult {
     preSanitizeMessagesHash: string;
     finalMessagesHash: string;
     overflowDiagnostics: AssemblyOverflowDiagnostics;
+    /** Number of wiki entries injected at head of context (0 when wiki disabled). */
+    wikiHitCount: number;
+    /** Estimated tokens consumed by injected wiki content. */
+    wikiTokens: number;
+    /** Token budget actually allocated to LCM history (input.tokenBudget − wikiBudgetUsed). */
+    lcmBudget: number;
   };
 }
 
@@ -1067,6 +1089,14 @@ export class ContextAssembler {
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private timezone?: string,
+    /**
+     * Optional wiki retrieval engine. When provided AND `input.wikiBudget > 0`
+     * AND `input.prompt` is searchable, top-scoring wiki hits are injected as a
+     * synthetic user message at the head of assembled context. The wiki
+     * budget is subtracted from the LCM budget so the combined prompt stays
+     * within `input.tokenBudget`.
+     */
+    private wikiEngine?: WikiRetrievalEngine,
   ) {}
 
   /**
@@ -1081,7 +1111,14 @@ export class ContextAssembler {
    * 5. Return the final ordered messages in chronological order.
    */
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
-    const { conversationId, tokenBudget } = input;
+    const { conversationId } = input;
+    // Reserve the wiki budget upfront and run LCM assembly with the reduced
+    // budget so the combined prompt (wiki + LCM) stays within input.tokenBudget.
+    // The wiki engine is best-effort: if it returns no hits we still ran with
+    // a reduced budget, which is harmless (final prompt is just smaller).
+    const wikiHits: readonly WikiHit[] = this.runWikiRetrieval(input);
+    const wikiTokensUsed = sumWikiTokens(wikiHits);
+    const tokenBudget = Math.max(0, input.tokenBudget - wikiTokensUsed);
     const freshTailCount = input.freshTailCount ?? 8;
 
     // Step 1: Get all context items ordered by ordinal
@@ -1266,9 +1303,23 @@ export class ContextAssembler {
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+
+    // Inject wiki hits at the head of assembled context as a synthetic user
+    // message. The XML wrapper signals to the model that this is reference
+    // knowledge, not conversation history. Wiki tokens were already reserved
+    // out of `input.tokenBudget` at the top of assemble(), so the combined
+    // prompt fits within the requested budget.
+    const finalMessages: AgentMessage[] = wikiHits.length > 0
+      ? [
+          { role: "user", content: formatWikiHits(wikiHits) } as AgentMessage,
+          ...repaired,
+        ]
+      : repaired;
+    const finalEstimatedTokens = estimatedTokens + wikiTokensUsed;
+
     return {
-      messages: repaired,
-      estimatedTokens,
+      messages: finalMessages,
+      estimatedTokens: finalEstimatedTokens,
       stats: {
         rawMessageCount,
         summaryCount,
@@ -1294,11 +1345,30 @@ export class ContextAssembler {
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,
+        wikiHitCount: wikiHits.length,
+        wikiTokens: wikiTokensUsed,
+        lcmBudget: tokenBudget,
       },
     };
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Score wiki entries against `input.prompt` and return the hits to inject.
+   * Returns `[]` when no engine is configured, the wiki budget is zero, or
+   * the prompt is missing/unsearchable. The returned hits' combined body
+   * tokens are guaranteed to fit within `input.wikiBudget`.
+   */
+  private runWikiRetrieval(input: AssembleContextInput): WikiHit[] {
+    if (!this.wikiEngine) return [];
+    if (typeof input.wikiBudget !== "number" || input.wikiBudget <= 0) return [];
+    if (typeof input.prompt !== "string" || input.prompt.trim().length === 0) return [];
+    return this.wikiEngine.searchWiki(input.prompt, {
+      maxEntries: input.wikiMaxEntries ?? 8,
+      maxTokens: input.wikiBudget,
+    });
+  }
 
   /**
    * Resolve a list of context items into ResolvedItems by fetching the

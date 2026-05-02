@@ -8,7 +8,8 @@ type StartupBannerKey =
   | "stateless-session-patterns"
   | "ignore-session-patterns-env-override"
   | "stateless-session-patterns-env-override"
-  | "state-dir";
+  | "state-dir"
+  | "wiki-retrieval";
 
 type StartupBannerLogState = {
   emitted: Set<StartupBannerKey>;

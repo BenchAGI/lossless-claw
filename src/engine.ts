@@ -48,6 +48,7 @@ import {
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
+import { WikiRetrievalEngine } from "./wiki/retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
@@ -1683,6 +1684,7 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
+  private wikiEngine?: WikiRetrievalEngine;
   private readonly db: DatabaseSync;
   private migrated = false;
   private readonly fts5Available: boolean;
@@ -1796,10 +1798,22 @@ export class LcmContextEngine implements ContextEngine {
         message: `[lcm] Stateless session patterns${enforcement} from ${source}: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }
+    if (this.config.wikiEnabled) {
+      this.wikiEngine = new WikiRetrievalEngine({
+        vaultPath: this.config.wikiVaultPath,
+        refreshIntervalMs: this.config.wikiRefreshIntervalMs,
+      });
+      logStartupBannerOnce({
+        key: "wiki-retrieval",
+        log: (message) => this.deps.log.info(message),
+        message: `[lcm] Wiki retrieval enabled: vault=${this.config.wikiVaultPath} budgetFraction=${this.config.wikiBudgetFraction} maxTokens=${this.config.wikiMaxTokens} maxEntries=${this.config.wikiMaxEntries}`,
+      });
+    }
     this.assembler = new ContextAssembler(
       this.conversationStore,
       this.summaryStore,
       this.config.timezone,
+      this.wikiEngine,
     );
 
     const compactionConfig: CompactionConfig = {
@@ -6177,6 +6191,21 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /**
+   * Compute the wiki token reservation for a given total token budget.
+   * Returns 0 when wiki retrieval is disabled, the engine is not constructed,
+   * or the configured fraction yields a non-positive amount. Always bounded
+   * above by `config.wikiMaxTokens`.
+   */
+  private computeWikiBudget(tokenBudget: number): number {
+    if (!this.wikiEngine || !this.config.wikiEnabled) return 0;
+    if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) return 0;
+    const fraction = this.config.wikiBudgetFraction;
+    if (!Number.isFinite(fraction) || fraction <= 0) return 0;
+    const fromFraction = Math.floor(tokenBudget * fraction);
+    return Math.max(0, Math.min(fromFraction, this.config.wikiMaxTokens));
+  }
+
   async assemble(params: {
     sessionId: string;
     sessionKey?: string;
@@ -6274,6 +6303,7 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
+      const wikiBudget = this.computeWikiBudget(tokenBudget);
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
         tokenBudget,
@@ -6282,6 +6312,8 @@ export class LcmContextEngine implements ContextEngine {
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
         orphanStrippingOrdinal: stableOrphanStrippingOrdinal,
+        wikiBudget,
+        wikiMaxEntries: this.config.wikiMaxEntries,
       });
       if (cacheAwareState === "hot") {
         this.setStableOrphanStrippingOrdinal(
